@@ -4,12 +4,12 @@
 // =================================================================
 // RUNTIME STATE VARIABLES
 // =================================================================
-// Concurrency mutex for thread-safe access between ISRs and main loop
+// Spinlock for quick, atomic state updates between ISR and main loop
 portMUX_TYPE stateMux = portMUX_INITIALIZER_UNLOCKED;
 
 // Volatile state arrays accessed in both interrupt and main contexts
-volatile bool lightState[NUM_LIGHTS]       = {false, false, false, false};
-volatile bool manualOverride[NUM_LIGHTS]   = {false, false, false, false};
+volatile bool lightState[NUM_LIGHTS]          = {false, false, false, false};
+volatile bool manualOverride[NUM_LIGHTS]      = {false, false, false, false};
 volatile uint32_t lastButtonPress[NUM_LIGHTS] = {0, 0, 0, 0};
 
 // Motion tracking variables
@@ -52,14 +52,18 @@ void IRAM_ATTR handleButtonPress(uint8_t index) {
 
   // Software debounce filter
   if ((currentTime - lastButtonPress[index]) > DEBOUNCE_DELAY_MS) {
+    bool newState = false;
+
+    // Fast atomic critical section: only mutate memory variables
     portENTER_CRITICAL_ISR(&stateMux);
     lightState[index] = !lightState[index];
     manualOverride[index] = true;
     lastButtonPress[index] = currentTime;
-    
-    // Switch physical relay immediately
-    writeRelay(index, lightState[index]);
+    newState = lightState[index];
     portEXIT_CRITICAL_ISR(&stateMux);
+
+    // Switch relay outside critical section
+    writeRelay(index, newState);
   }
 }
 
@@ -122,31 +126,41 @@ void loop() {
 
     // Turn on lights that are not manually overridden
     for (uint8_t i = 0; i < NUM_LIGHTS; i++) {
-      portENTER_CRITICAL(&stateMux);
-      const bool isOverridden = manualOverride[i];
-      const bool isCurrentlyOn = lightState[i];
+      bool needTurnOn = false;
 
-      if (!isOverridden && !isCurrentlyOn) {
+      // Fast atomic check and state update
+      portENTER_CRITICAL(&stateMux);
+      if (!manualOverride[i] && !lightState[i]) {
         lightState[i] = true;
+        needTurnOn = true;
+      }
+      portEXIT_CRITICAL(&stateMux);
+
+      // Perform I/O outside critical section
+      if (needTurnOn) {
         writeRelay(i, true);
         Serial.printf("[AUTO] Channel %u turned ON by motion.\n", i + 1);
       }
-      portEXIT_CRITICAL(&stateMux);
     }
   } else {
     // Inactivity timeout: turn off lights after motion timeout expires
     if ((currentTime - lastMotionTime) > MOTION_TIMEOUT_MS) {
       for (uint8_t i = 0; i < NUM_LIGHTS; i++) {
-        portENTER_CRITICAL(&stateMux);
-        const bool isOverridden = manualOverride[i];
-        const bool isCurrentlyOn = lightState[i];
+        bool needTurnOff = false;
 
-        if (!isOverridden && isCurrentlyOn) {
+        // Fast atomic check and state update
+        portENTER_CRITICAL(&stateMux);
+        if (!manualOverride[i] && lightState[i]) {
           lightState[i] = false;
+          needTurnOff = true;
+        }
+        portEXIT_CRITICAL(&stateMux);
+
+        // Perform I/O outside critical section
+        if (needTurnOff) {
           writeRelay(i, false);
           Serial.printf("[AUTO] Channel %u turned OFF after inactivity.\n", i + 1);
         }
-        portEXIT_CRITICAL(&stateMux);
       }
     }
   }
