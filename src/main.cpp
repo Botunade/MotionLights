@@ -4,107 +4,105 @@
 // =================================================================
 // RUNTIME STATE VARIABLES
 // =================================================================
-// Spinlock for quick, atomic state updates between ISR and main loop
 portMUX_TYPE stateMux = portMUX_INITIALIZER_UNLOCKED;
 
-// Volatile state arrays accessed in both interrupt and main contexts
+// Per-channel light state (used by both ISRs and main loop)
 volatile bool lightState[NUM_LIGHTS]          = {false, false, false, false};
-volatile bool manualOverride[NUM_LIGHTS]      = {false, false, false, false};
 volatile uint32_t lastButtonPress[NUM_LIGHTS] = {0, 0, 0, 0};
 
-// Motion tracking variables
+// Motion tracking
 uint32_t lastMotionTime = 0;
 bool previousMotionDetected = false;
+
+// Master override state tracking (for edge-logging only)
+bool masterOverrideActive  = false;
+bool prevMasterOverride    = false;
 
 // =================================================================
 // HARDWARE DRIVER HELPERS
 // =================================================================
 
-/**
- * @brief Sets the physical relay pin according to active-low logic.
- * @param index Light channel index (0 to NUM_LIGHTS - 1)
- * @param turnOn True to turn light ON, false to turn light OFF
- */
 inline void writeRelay(uint8_t index, bool turnOn) {
   if (index < NUM_LIGHTS) {
     digitalWrite(RELAY_PINS[index], turnOn ? RELAY_ON : RELAY_OFF);
   }
 }
 
-/**
- * @brief Checks whether either PIR sensor is actively reporting motion.
- * @return true if motion is detected on PIR 1 or PIR 2
- */
 inline bool isMotionDetected() {
   return (digitalRead(PIR_PIN_1) == HIGH) || (digitalRead(PIR_PIN_2) == HIGH);
 }
 
+/**
+ * @brief Turns off all 4 relay channels immediately.
+ */
+void allLightsOff() {
+  portENTER_CRITICAL(&stateMux);
+  for (uint8_t i = 0; i < NUM_LIGHTS; i++) {
+    lightState[i] = false;
+  }
+  portEXIT_CRITICAL(&stateMux);
+
+  for (uint8_t i = 0; i < NUM_LIGHTS; i++) {
+    writeRelay(i, false);
+  }
+}
+
 // =================================================================
-// INTERRUPT SERVICE ROUTINES (ISRs)
+// BUTTON ISRs (per-channel toggle — operates only when master override is INACTIVE)
 // =================================================================
 
-/**
- * @brief Shared button handler executed on falling-edge pin interrupts.
- * @param index Button channel index (0 to NUM_LIGHTS - 1)
- */
 void IRAM_ATTR handleButtonPress(uint8_t index) {
   uint32_t currentTime = millis();
 
-  // Software debounce filter
   if ((currentTime - lastButtonPress[index]) > DEBOUNCE_DELAY_MS) {
     bool newState = false;
 
-    // Fast atomic critical section: only mutate memory variables
     portENTER_CRITICAL_ISR(&stateMux);
     lightState[index] = !lightState[index];
-    manualOverride[index] = true;
-    lastButtonPress[index] = currentTime;
     newState = lightState[index];
+    lastButtonPress[index] = currentTime;
     portEXIT_CRITICAL_ISR(&stateMux);
 
-    // Switch relay outside critical section
     writeRelay(index, newState);
   }
 }
 
-// Individual ISR entry points routed to the common handler
 void IRAM_ATTR isr0() { handleButtonPress(0); }
 void IRAM_ATTR isr1() { handleButtonPress(1); }
 void IRAM_ATTR isr2() { handleButtonPress(2); }
 void IRAM_ATTR isr3() { handleButtonPress(3); }
 
 // =================================================================
-// SETUP & INITIALIZATION
+// SETUP
 // =================================================================
 
 void setup() {
   Serial.begin(SERIAL_BAUD_RATE);
-  delay(200); // Allow serial line stabilization
+  delay(200);
   Serial.println("\n==============================================");
-  Serial.println(" ESP32 MotionLights Controller Initializing   ");
+  Serial.println("   ESP32 MotionLights Controller v2.0        ");
   Serial.println("==============================================");
 
-  // Initialize PIR sensor pins as digital inputs
-  pinMode(PIR_PIN_1, INPUT);
-  pinMode(PIR_PIN_2, INPUT);
+  // Master override pin: HIGH when inactive, LOW when override wire is connected
+  pinMode(MASTER_OVERRIDE_PIN, INPUT_PULLUP);
 
-  // Initialize relay outputs and button inputs
+  // PIR sensor pins
+  pinMode(PIR_PIN_1, INPUT_PULLDOWN);
+  pinMode(PIR_PIN_2, INPUT_PULLDOWN);
+
+  // Relay outputs and per-channel button inputs
   for (uint8_t i = 0; i < NUM_LIGHTS; i++) {
-    // Default relay to OFF prior to driving output to avoid power-on click
-    writeRelay(i, false);
     pinMode(RELAY_PINS[i], OUTPUT);
-
-    // Pushbuttons with internal pullup
+    writeRelay(i, false);            // Start all relays OFF
     pinMode(BUTTON_PINS[i], INPUT_PULLUP);
   }
 
-  // Attach hardware interrupts on FALLING edge (active-low button push)
   attachInterrupt(digitalPinToInterrupt(BUTTON_PINS[0]), isr0, FALLING);
   attachInterrupt(digitalPinToInterrupt(BUTTON_PINS[1]), isr1, FALLING);
   attachInterrupt(digitalPinToInterrupt(BUTTON_PINS[2]), isr2, FALLING);
   attachInterrupt(digitalPinToInterrupt(BUTTON_PINS[3]), isr3, FALLING);
 
-  Serial.println("[SYSTEM] Setup completed successfully. Entering main loop.");
+  Serial.println("[SYSTEM] Ready. Entering main loop.");
 }
 
 // =================================================================
@@ -113,74 +111,80 @@ void setup() {
 
 void loop() {
   const uint32_t currentTime = millis();
+
+  // ---------------------------------------------------------------
+  // 1. READ MASTER OVERRIDE WIRE (GPIO 32 → GND = override active)
+  // ---------------------------------------------------------------
+  masterOverrideActive = (digitalRead(MASTER_OVERRIDE_PIN) == LOW);
+
+  // Log transitions once (not every 50ms)
+  if (masterOverrideActive && !prevMasterOverride) {
+    Serial.println("[OVERRIDE] Master override ACTIVE — all lights OFF, PIR disabled.");
+    allLightsOff();
+    // Push lastMotionTime forward so PIR doesn't trigger the instant override releases
+    lastMotionTime = currentTime;
+  }
+  if (!masterOverrideActive && prevMasterOverride) {
+    Serial.println("[OVERRIDE] Master override RELEASED — resuming automatic PIR control.");
+    // Reset lastMotionTime so the 10-second inactivity clock starts fresh
+    lastMotionTime = currentTime;
+  }
+  prevMasterOverride = masterOverrideActive;
+
+  // While override is active: keep all lights off and skip all PIR logic
+  if (masterOverrideActive) {
+    allLightsOff();          // Continuously enforce OFF in case an ISR toggled a relay
+    delay(LOOP_POLL_INTERVAL_MS);
+    return;
+  }
+
+  // ---------------------------------------------------------------
+  // 2. NORMAL PIR AUTOMATION (only reached when override is inactive)
+  // ---------------------------------------------------------------
   const bool motionNow = isMotionDetected();
 
-  // Log state transition on motion start
   if (motionNow && !previousMotionDetected) {
-    Serial.println("[PIR] Motion detected! Activating automatic lights.");
+    Serial.println("[PIR] Motion detected! Activating lights.");
   }
   previousMotionDetected = motionNow;
 
   if (motionNow) {
     lastMotionTime = currentTime;
 
-    // Turn on lights that are not manually overridden
+    // Turn on any light that is currently off
     for (uint8_t i = 0; i < NUM_LIGHTS; i++) {
       bool needTurnOn = false;
 
-      // Fast atomic check and state update
       portENTER_CRITICAL(&stateMux);
-      if (!manualOverride[i] && !lightState[i]) {
+      if (!lightState[i]) {
         lightState[i] = true;
         needTurnOn = true;
       }
       portEXIT_CRITICAL(&stateMux);
 
-      // Perform I/O outside critical section
       if (needTurnOn) {
         writeRelay(i, true);
-        Serial.printf("[AUTO] Channel %u turned ON by motion.\n", i + 1);
+        Serial.printf("[AUTO] Channel %u ON by motion.\n", i + 1);
       }
     }
   } else {
-    // Inactivity timeout: turn off lights after motion timeout expires
+    // No motion: turn off all channels after inactivity timeout
     if ((currentTime - lastMotionTime) > MOTION_TIMEOUT_MS) {
       for (uint8_t i = 0; i < NUM_LIGHTS; i++) {
         bool needTurnOff = false;
 
-        // Fast atomic check and state update
         portENTER_CRITICAL(&stateMux);
-        if (!manualOverride[i] && lightState[i]) {
+        if (lightState[i]) {
           lightState[i] = false;
           needTurnOff = true;
         }
         portEXIT_CRITICAL(&stateMux);
 
-        // Perform I/O outside critical section
         if (needTurnOff) {
           writeRelay(i, false);
-          Serial.printf("[AUTO] Channel %u turned OFF after inactivity.\n", i + 1);
+          Serial.printf("[AUTO] Channel %u OFF (inactivity timeout).\n", i + 1);
         }
       }
-    }
-  }
-
-  // Room vacant reset: re-arm automation when room is quiet for timeout + reset delay
-  const uint32_t totalResetWindow = MOTION_TIMEOUT_MS + OVERRIDE_RESET_DELAY_MS;
-  if (!motionNow && ((currentTime - lastMotionTime) > totalResetWindow)) {
-    bool hadActiveOverride = false;
-
-    portENTER_CRITICAL(&stateMux);
-    for (uint8_t i = 0; i < NUM_LIGHTS; i++) {
-      if (manualOverride[i]) {
-        manualOverride[i] = false;
-        hadActiveOverride = true;
-      }
-    }
-    portEXIT_CRITICAL(&stateMux);
-
-    if (hadActiveOverride) {
-      Serial.println("[AUTO] Room vacancy detected. All manual overrides cleared.");
     }
   }
 
