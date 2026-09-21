@@ -4,13 +4,12 @@
 // =================================================================
 // RUNTIME STATE
 // =================================================================
-bool lightState[NUM_LIGHTS]      = {false, false, false, false};
-bool manualOverride[NUM_LIGHTS]  = {false, false, false, false};
+bool lightState[NUM_LIGHTS]     = {false, false, false, false};
+bool manualOverride[NUM_LIGHTS] = {false, false, false, false};
 
-// For change-detection (only print when something actually changes)
-bool prevOverride[NUM_LIGHTS]    = {false, false, false, false};
-bool prevLightState[NUM_LIGHTS]  = {false, false, false, false};
-bool prevMotionDetected          = false;
+// Edge-detection: only print when state actually changes
+bool prevOverride[NUM_LIGHTS]   = {false, false, false, false};
+bool prevMotionDetected         = false;
 
 uint32_t lastMotionTime = 0;
 
@@ -36,19 +35,19 @@ void setup() {
   Serial.println("\n==============================================");
   Serial.println("   ESP32 MotionLights Controller             ");
   Serial.println("==============================================");
-  Serial.println("[INFO] Switch LOW = relay ON, PIR ignored.");
-  Serial.println("[INFO] Switch HIGH = PIR automatic control.");
+  Serial.println("[INFO] Switch LOW  = relay FORCED OFF, PIR disabled for that channel.");
+  Serial.println("[INFO] Switch HIGH = PIR automatic control for that channel.");
 
-  // PIR pins — input only, no pullup needed (PIR drives them actively)
+  // PIR sensor pins (driven actively by sensor, no internal pull needed)
   pinMode(PIR_PIN_1, INPUT);
   pinMode(PIR_PIN_2, INPUT);
 
-  // Relay outputs: default to OFF before setting as output (prevents boot click)
+  // Relay outputs: write OFF state before setting as OUTPUT to prevent boot click
   for (uint8_t i = 0; i < NUM_LIGHTS; i++) {
     digitalWrite(RELAY_PINS[i], RELAY_OFF);
     pinMode(RELAY_PINS[i], OUTPUT);
 
-    // Switch pins: internal pullup — HIGH when released, LOW when shorted to GND
+    // Switch pins: internal pull-up — HIGH when released, LOW when shorted to GND
     pinMode(SWITCH_PINS[i], INPUT_PULLUP);
   }
 
@@ -63,41 +62,44 @@ void loop() {
   const uint32_t currentTime = millis();
 
   // ---------------------------------------------------------------
-  // 1. READ SWITCH STATES (level-triggered)
-  //    LOW  → switch is held to GND → manual override ON for this channel
-  //    HIGH → switch is floating    → PIR automatic control for this channel
+  // 1. READ SWITCH STATES (level-triggered, read every 50ms)
+  //    LOW  = switch held to GND → FORCE relay OFF, PIR blocked
+  //    HIGH = switch released    → PIR controls this channel
   // ---------------------------------------------------------------
   for (uint8_t i = 0; i < NUM_LIGHTS; i++) {
     manualOverride[i] = (digitalRead(SWITCH_PINS[i]) == LOW);
 
-    // Log transition: switch just pulled to GND
     if (manualOverride[i] && !prevOverride[i]) {
-      Serial.printf("[SWITCH %u] Pulled LOW → Relay ON, PIR disabled for ch%u.\n", i + 1, i + 1);
+      // Switch just pulled LOW: kill relay immediately, block PIR
+      lightState[i] = false;
+      writeRelay(i, false);
+      Serial.printf("[SWITCH %u] Pulled LOW → Relay FORCED OFF, PIR disabled for ch%u.\n", i + 1, i + 1);
     }
-    // Log transition: switch just released
+
     if (!manualOverride[i] && prevOverride[i]) {
-      Serial.printf("[SWITCH %u] Released → PIR automation resumed for ch%u.\n", i + 1, i + 1);
-      // Reset motion clock so the channel doesn't immediately time-out
+      // Switch just released: hand back to PIR automation
+      // Reset motion clock so timeout doesn't immediately fire
       lastMotionTime = currentTime;
+      Serial.printf("[SWITCH %u] Released → PIR automation resumed for ch%u.\n", i + 1, i + 1);
     }
+
     prevOverride[i] = manualOverride[i];
   }
 
   // ---------------------------------------------------------------
-  // 2. APPLY MANUAL OVERRIDES
-  //    Channels with switch LOW are forced ON and immune to PIR.
+  // 2. ENFORCE OVERRIDES CONTINUOUSLY
+  //    Any channel with switch held LOW stays OFF regardless of PIR.
   // ---------------------------------------------------------------
   for (uint8_t i = 0; i < NUM_LIGHTS; i++) {
-    if (manualOverride[i] && !lightState[i]) {
-      lightState[i] = true;
-      writeRelay(i, true);
+    if (manualOverride[i] && lightState[i]) {
+      // Catch edge case where PIR fired before we processed the switch
+      lightState[i] = false;
+      writeRelay(i, false);
     }
-    // When switch is released, PIR logic (below) takes over — do not force OFF here
-    // (PIR timeout will handle turning it off naturally)
   }
 
   // ---------------------------------------------------------------
-  // 3. PIR AUTOMATION (applies only to channels NOT held by a switch)
+  // 3. PIR AUTOMATION (only for channels whose switch is released)
   // ---------------------------------------------------------------
   const bool motionNow = isMotionDetected();
 
@@ -112,8 +114,8 @@ void loop() {
   if (motionNow) {
     lastMotionTime = currentTime;
 
-    // Turn ON every channel that is NOT manually overridden and is currently OFF
     for (uint8_t i = 0; i < NUM_LIGHTS; i++) {
+      // Only act on channels NOT held by a switch
       if (!manualOverride[i] && !lightState[i]) {
         lightState[i] = true;
         writeRelay(i, true);
@@ -121,7 +123,7 @@ void loop() {
       }
     }
   } else {
-    // No motion: turn OFF non-overridden channels after timeout
+    // No motion: after timeout, turn off non-overridden channels
     if ((currentTime - lastMotionTime) > MOTION_TIMEOUT_MS) {
       for (uint8_t i = 0; i < NUM_LIGHTS; i++) {
         if (!manualOverride[i] && lightState[i]) {
@@ -130,16 +132,6 @@ void loop() {
           Serial.printf("[AUTO] Channel %u OFF — inactivity timeout.\n", i + 1);
         }
       }
-    }
-  }
-
-  // ---------------------------------------------------------------
-  // 4. SYNC STATE: if switch released while light was ON (from PIR),
-  //    update lightState to match actual relay so timeout logic is correct.
-  // ---------------------------------------------------------------
-  for (uint8_t i = 0; i < NUM_LIGHTS; i++) {
-    if (lightState[i] != prevLightState[i]) {
-      prevLightState[i] = lightState[i];
     }
   }
 
