@@ -19,10 +19,16 @@ constexpr uint8_t SWITCH_PINS[NUM_LIGHTS] = {13, 14, 26, 27};
 // Relay outputs (Active-Low pre-built relay boards).
 constexpr uint8_t RELAY_PINS[NUM_LIGHTS] = {16, 17, 18, 19};
 
-// PIR Sensors: Input-Only pins (no internal pull-up/down).
-// PIR output is HIGH when motion is detected, LOW otherwise.
-constexpr uint8_t PIR_PIN_1 = 34;
-constexpr uint8_t PIR_PIN_2 = 35;
+// PIR Sensors: GPIO 32 & 33 support INPUT_PULLDOWN, holding pins LOW when
+// sensor is disconnected — prevents floating-pin false triggers.
+// (GPIO 34/35 are input-only with NO internal pull-down, avoid for PIR use.)
+constexpr uint8_t PIR_PIN_1 = 32;
+constexpr uint8_t PIR_PIN_2 = 33;
+
+// PIR confirmation filter: signal must be stable for this many consecutive
+// loop ticks before motion is accepted (1 tick = LOOP_POLL_INTERVAL_MS).
+// 3 ticks × 50ms = 150ms confirmation window — filters noise spikes.
+constexpr uint8_t PIR_CONFIRM_TICKS = 3;
 
 // =================================================================
 // ELECTRICAL POLARITY
